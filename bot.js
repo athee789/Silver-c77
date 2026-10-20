@@ -1528,38 +1528,62 @@ function getExpTitle(level) {
 async function getInactiveMembers(groupMetadata, groupActivityData, myJid, threshold = 50) {
   const inactive = [];
 
-  for (const participant of groupMetadata.participants) {
-
-    // Skip admins
+  for (const participant of (groupMetadata.participants || [])) {
     if (
       participant.admin === "admin" ||
       participant.admin === "superadmin"
     ) continue;
 
-    // Skip bot
-    if (normalizeJid(participant.id) === normalizeJid(myJid))
-      continue;
+    const participantJids = [
+      participant?.id,
+      participant?.jid,
+      participant?.lid,
+      participant?.phoneNumber
+    ].filter(value => typeof value === "string" && value.trim());
 
-    const data = groupActivityData[participant.id] || {
-      count: 0,
-      lastMessage: null
-    };
+    if (participantJids.some(
+      jid => normalizeJid(jid) === normalizeJid(myJid)
+    )) continue;
 
-    if (data.count < threshold) {
+    const possibleJids = new Set();
+
+    for (const jid of participantJids) {
+      possibleJids.add(jid);
+
+      if (/^\d+$/.test(jid)) {
+        possibleJids.add(`${jid}@s.whatsapp.net`);
+      }
+    }
+
+    let data = { count: 0, lastMessage: null };
+
+    // Use the highest matching count, not the sum, because
+    // alternate JIDs can refer to the same person.
+    for (const jid of possibleJids) {
+      const record = groupActivityData?.[jid];
+
+      if (
+        record &&
+        Number.isFinite(Number(record.count)) &&
+        Number(record.count) > Number(data.count)
+      ) {
+        data = record;
+      }
+    }
+
+    if (Number(data.count) < threshold) {
       inactive.push({
-        jid: participant.id,
-        count: data.count,
-        lastMessage: data.lastMessage
+        jid: participant.id || participantJids[0],
+        count: Number(data.count) || 0,
+        lastMessage: data.lastMessage ?? null
       });
     }
   }
 
   inactive.sort((a, b) => a.count - b.count);
-
   return inactive;
 }
 
-// ============================================
 // Auto-save data every 5 minutes
 setInterval(() => {
   saveData();
