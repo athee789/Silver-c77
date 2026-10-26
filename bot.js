@@ -3529,99 +3529,202 @@ Ready to manage!`,
       // 🌍 AUTOMATIC COUNTRY-BAN PROTECTION
       // ============================================
 
-      const countryBans =
-        bannedCountryCodes[groupJid] || [];
+      const countryBans = [
+        ...new Set(
+          (Array.isArray(bannedCountryCodes[groupJid])
+            ? bannedCountryCodes[groupJid]
+            : [])
+            .map((code) => String(code).replace(/\D/g, ""))
+            .filter(Boolean)
+        )
+      ].sort((a, b) => b.length - a.length);
 
-      const countryBannedParticipants =
-        new Set();
+      const countryBannedParticipants = new Set();
 
       if (countryBans.length > 0) {
+        // Metadata may contain the phone-number identity even when the
+        // participant update only supplies an @lid JID.
+        let countryBanMetadata = null;
+        try {
+          countryBanMetadata = await sock.groupMetadata(groupJid);
+        } catch (err) {
+          logger.warn(
+            `Country-ban metadata lookup failed for ${groupJid}: ${err.message}`
+          );
+        }
+
+        const identityKey = (value) => {
+          if ((typeof value !== "string" && typeof value !== "number") || !String(value).trim()) {
+            return "";
+          }
+
+          const raw = String(value).trim();
+          if (!raw.includes("@")) return raw.split(":")[0];
+
+          const [local, server] = raw.split("@");
+          return `${local.split(":")[0]}@${server}`;
+        };
+
+        const asPhoneJid = (value, allowBareNumber = false) => {
+          if (typeof value !== "string" && typeof value !== "number") {
+            return null;
+          }
+
+          const raw = String(value).trim();
+          if (!raw || /@(lid|g\.us|broadcast)$/.test(raw)) return null;
+
+          if (raw.endsWith("@s.whatsapp.net")) {
+            const digits = raw
+              .split("@")[0]
+              .split(":")[0]
+              .replace(/\D/g, "");
+            return digits ? `${digits}@s.whatsapp.net` : null;
+          }
+
+          // A bare number is trusted only when it came from an explicit
+          // phone-number field, never from an @lid identifier.
+          if (allowBareNumber && !raw.includes("@")) {
+            const digits = raw.split(":")[0].replace(/\D/g, "");
+            return digits.length >= 7 && digits.length <= 15
+              ? `${digits}@s.whatsapp.net`
+              : null;
+          }
+
+          return null;
+        };
+
         for (const participant of participants) {
           const participantJid =
-            typeof participant === 'string'
+            typeof participant === "string"
               ? participant
               : participant?.id ||
                 participant?.jid ||
+                participant?.lid ||
+                participant?.phoneNumber ||
                 String(participant);
 
-          let phoneJid = participantJid;
+          const participantFields =
+            typeof participant === "object" && participant !== null
+              ? [
+                  participant.id,
+                  participant.jid,
+                  participant.lid,
+                  participant.phoneNumber,
+                  participant.pn
+                ].filter((value) => typeof value === "string" || typeof value === "number")
+              : [participantJid];
 
-          // Resolve LID -> phone JID when possible.
-          if (participantJid.endsWith('@lid')) {
-            try {
-              const mapping =
-                sock.signalRepository?.lidMapping;
+          let phoneJid = null;
 
-              if (
-                mapping &&
-                typeof mapping.getPNForLID === 'function'
-              ) {
-                const pn =
-                  await mapping.getPNForLID(participantJid);
+          // Prefer an explicit phone-number field if the event supplies one.
+          if (typeof participant === "object" && participant !== null) {
+            phoneJid =
+              asPhoneJid(participant.phoneNumber, true) ||
+              asPhoneJid(participant.pn, true);
+          }
 
-                if (
-                  pn &&
-                  String(pn).endsWith('@s.whatsapp.net')
-                ) {
-                  phoneJid = String(pn);
-                }
+          // Otherwise, use a PN JID if the participant update supplied one.
+          if (!phoneJid) {
+            phoneJid = participantFields
+              .map((value) => asPhoneJid(value))
+              .find(Boolean) || null;
+          }
+
+          // Try Baileys' cached LID -> PN mapping.
+          if (!phoneJid) {
+            const lidJid = participantFields.find((value) =>
+              typeof value === "string" && value.endsWith("@lid")
+            );
+
+            if (lidJid) {
+              try {
+                const pn = await sock.signalRepository?.lidMapping?.getPNForLID(lidJid);
+                phoneJid = asPhoneJid(pn);
+              } catch (err) {
+                logger.warn(
+                  `Country-ban LID mapping failed for ${lidJid}: ${err.message}`
+                );
               }
-            } catch (err) {
-              logger.warn(
-                `Could not resolve country-ban LID ${participantJid}: ${err.message}`
-              );
             }
           }
 
-          if (
-            !phoneJid ||
-            !phoneJid.endsWith('@s.whatsapp.net')
-          ) {
-            continue;
-          }
-
-          const phoneNumber =
-            phoneJid
-              .split('@')[0]
-              .replace(/[^\d]/g, '');
-
-          const matchedCode =
-            countryBans.find((code) =>
-              phoneNumber.startsWith(code)
+          // Finally, match the event identity against current group metadata.
+          // This covers participant objects that expose phoneNumber separately.
+          if (!phoneJid && Array.isArray(countryBanMetadata?.participants)) {
+            const eventKeys = new Set(
+              participantFields.map(identityKey).filter(Boolean)
             );
 
-          if (!matchedCode) {
+            const metadataParticipant = countryBanMetadata.participants.find((entry) => {
+              const metadataFields = [
+                entry?.id,
+                entry?.jid,
+                entry?.lid,
+                entry?.phoneNumber,
+                entry?.pn
+              ].filter((value) => typeof value === "string" || typeof value === "number");
+
+              return metadataFields.some((value) => eventKeys.has(identityKey(value)));
+            });
+
+            if (metadataParticipant) {
+              phoneJid =
+                asPhoneJid(metadataParticipant.phoneNumber, true) ||
+                asPhoneJid(metadataParticipant.pn, true) ||
+                [metadataParticipant.id, metadataParticipant.jid, metadataParticipant.lid]
+                  .map((value) => asPhoneJid(value))
+                  .find(Boolean) || null;
+            }
+          }
+
+          if (!phoneJid) {
+            logger.warn(
+              `Country-ban could not resolve a phone number for ${participantJid} in ${groupJid}; member was not country-checked`
+            );
             continue;
           }
 
-          countryBannedParticipants.add(
-            participantJid
+          const phoneNumber = phoneJid
+            .split("@")[0]
+            .replace(/\D/g, "");
+
+          const matchedCode = countryBans.find((code) =>
+            phoneNumber.startsWith(code)
           );
+
+          if (!matchedCode) continue;
+
+          countryBannedParticipants.add(participantJid);
+          const removalJid =
+            typeof participantJid === "string" &&
+            /@(s\.whatsapp\.net|lid)$/.test(participantJid)
+              ? participantJid
+              : phoneJid;
 
           try {
             await sock.sendMessage(groupJid, {
               text:
                 "╭━━━〔 🚫 COUNTRY BANNED 〕━━━╮\n\n" +
-                `👤 @${participantJid.split("@")[0]}\n` +
+                `👤 @${removalJid.split("@")[0]}\n` +
                 `🌍 Country code: +${matchedCode}\n` +
                 "❌ This country code is banned from this group.\n" +
                 "👢 Removing automatically...\n\n" +
                 "╰━━━━━━━━━━━━━━━━━━━━━━━━╯",
-              mentions: [participantJid]
+              mentions: [removalJid]
             });
 
             await sock.groupParticipantsUpdate(
               groupJid,
-              [participantJid],
-              'remove'
+              [removalJid],
+              "remove"
             );
 
             logger.info(
-              `Country-ban protection removed ${phoneJid} from ${groupJid} (country code +${matchedCode})`
+              `Country-ban protection removed ${removalJid} from ${groupJid} (country code +${matchedCode})`
             );
           } catch (err) {
             logger.error(
-              `Country-ban removal failed for ${phoneJid}: ${err.message}`
+              `Country-ban removal failed for ${removalJid}: ${err.message}`
             );
           }
         }
