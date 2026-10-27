@@ -6056,22 +6056,62 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
       }
 
       try {
-        const caption = args.join(" ").trim();
         const original = message.message || {};
-        const imageMsg = original.imageMessage;
-        const videoMsg = original.videoMessage;
+        const contextInfo =
+          original.extendedTextMessage?.contextInfo ||
+          original.imageMessage?.contextInfo ||
+          original.videoMessage?.contextInfo ||
+          original.ephemeralMessage?.message?.extendedTextMessage?.contextInfo ||
+          original.ephemeralMessage?.message?.imageMessage?.contextInfo ||
+          original.ephemeralMessage?.message?.videoMessage?.contextInfo ||
+          {};
+
+        const quoted = contextInfo.quotedMessage || {};
+        const commandText = args.join(" ").trim();
+
+        const currentMessage =
+          original.ephemeralMessage?.message || original;
+        const quotedMessage =
+          quoted.ephemeralMessage?.message || quoted;
+
+        const imageMsg =
+          currentMessage.imageMessage || quotedMessage.imageMessage;
+        const videoMsg =
+          currentMessage.videoMessage || quotedMessage.videoMessage;
+
+        const quotedText =
+          quotedMessage.conversation ||
+          quotedMessage.extendedTextMessage?.text ||
+          quotedMessage.imageMessage?.caption ||
+          quotedMessage.videoMessage?.caption ||
+          "";
+
+        const caption = commandText || quotedText.trim();
 
         let content;
         if (imageMsg || videoMsg) {
-          const buffer = await downloadMediaMessage(
-            message,
-            "buffer",
-            {},
-            {
-              logger: pino({ level: "silent" }),
-              reuploadRequest: sock.updateMediaMessage
-            }
-          );
+          let buffer;
+
+          if (currentMessage.imageMessage || currentMessage.videoMessage) {
+            buffer = await downloadMediaMessage(
+              message,
+              "buffer",
+              {},
+              {
+                logger: pino({ level: "silent" }),
+                reuploadRequest: sock.updateMediaMessage
+              }
+            );
+          } else {
+            const mediaType = imageMsg ? "image" : "video";
+            const stream = await downloadContentFromMessage(
+              imageMsg || videoMsg,
+              mediaType
+            );
+            const chunks = [];
+            for await (const chunk of stream) chunks.push(chunk);
+            buffer = Buffer.concat(chunks);
+          }
 
           content = imageMsg
             ? { image: buffer, caption }
@@ -6079,10 +6119,11 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
         } else {
           if (!caption) {
             await sock.sendMessage(message.key.remoteJid, {
-              text: "Usage: .groupstatus Your status text\nOr send an image/video with the command as its caption."
+              text: "Usage: .groupstatus Your status text\\nOr reply to a text/image/video with .groupstatus, or caption your media with the command."
             }, { quoted: message });
             return;
           }
+
           content = {
             text: caption,
             backgroundColor: "#673AB7"
