@@ -2961,6 +2961,14 @@ const getMenu = () => `
 ║ bann3 reset
 ║ abs on|off
 ║ abs add (ping,hack...)
+║ groupstatus — post a group status.
+║‎.delgcstatus — attempt deletion 
+║only if your installed Baileys 
+║version supports it.
+║‎.antigcstatus on/off/get — control
+║the new anti-group-status feature.
+║‎.antigcstatus set delete/kick — 
+║choose the enforcement mode.
 ╚═════════════════════════╝
 
 
