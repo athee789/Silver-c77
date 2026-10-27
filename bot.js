@@ -7,8 +7,12 @@ const {
   downloadContentFromMessage,
   fetchLatestBaileysVersion,
   Browsers,
+  generateWAMessageContent,
+  generateWAMessageFromContent,
 } = require("@whiskeysockets/baileys");
 
+const crypto = require("crypto");
+const groupStatusTracker = require("./group-status-tracker");
 const pino = require("pino");
 require("dotenv").config();
 const fs = require("fs");
@@ -833,6 +837,9 @@ const antiPhotoGroups = {};
 
 // Anti-Status Settings (for groups) - { groupJid: 'kick'|'warn'|false }
 const antiStatusGroups = {};
+// GROUP_STATUS_SAFE_PATCH_V1
+const antiGroupStatusGroups = {};
+const antiGroupStatusActions = {};
 
 // Anti-Tag Settings (for groups) - { groupJid: 'kick'|'warn'|false }
 const antiTagGroups = {};
@@ -990,6 +997,12 @@ if (data.nightModeGroups && Array.isArray(data.nightModeGroups)) {
       // Load anti-status groups
       if (data.antiStatusGroups) {
         Object.assign(antiStatusGroups, data.antiStatusGroups);
+      }
+      if (data.antiGroupStatusGroups) {
+        Object.assign(antiGroupStatusGroups, data.antiGroupStatusGroups);
+      }
+      if (data.antiGroupStatusActions) {
+        Object.assign(antiGroupStatusActions, data.antiGroupStatusActions);
       }
 
       // Load anti-tag groups
@@ -1223,6 +1236,8 @@ const saveData = () => {
       antiMentionGroups,
       antiPhotoGroups,
       antiStatusGroups,
+      antiGroupStatusGroups,
+      antiGroupStatusActions,
       antiTagGroups,
       antiSpamGroups,
       antiBotGroups,
@@ -1262,6 +1277,8 @@ const saveGroupSettingsToSupabase = async (groupJid) => {
       antiMention: antiMentionGroups[groupJid] ?? false,
       antiPhoto: antiPhotoGroups[groupJid] ?? false,
       antiStatus: antiStatusGroups[groupJid] ?? false,
+      antiGroupStatus: antiGroupStatusGroups[groupJid] ?? false,
+      antiGroupStatusAction: antiGroupStatusActions[groupJid] ?? "delete",
       antiTag: antiTagGroups[groupJid] ?? false,
       antiSpam: antiSpamGroups[groupJid] ?? false,
 
@@ -1349,6 +1366,10 @@ const loadGroupSettingsFromSupabase = async () => {
 
       antiStatusGroups[groupId] =
         settings.antiStatus || false;
+      antiGroupStatusGroups[groupId] =
+        Boolean(settings.antiGroupStatus);
+      antiGroupStatusActions[groupId] =
+        settings.antiGroupStatusAction || "delete";
 
       antiTagGroups[groupId] =
         settings.antiTag || false;
@@ -4269,6 +4290,75 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           return;
         }
 
+      // GROUP_STATUS_COMMANDS_V1: independent group-status enforcement.
+      if (groupStatusTracker.isGroupStatusMessage(earlyMessage)) {
+        groupStatusTracker.recordFromMessage({
+          key: message.key,
+          message: earlyMessage,
+        });
+
+        const statusGroup = earlyJid;
+        const statusSender =
+          message.key?.participant ||
+          message.key?.participantAlt;
+
+        if (
+          statusGroup?.endsWith("@g.us") &&
+          antiGroupStatusGroups[statusGroup] &&
+          !message.key?.fromMe &&
+          statusSender
+        ) {
+          const mode = antiGroupStatusActions[statusGroup] || "delete";
+
+          if (mode === "kick") {
+            try {
+              const metadata = await sock.groupMetadata(statusGroup);
+              const target = metadata.participants.find(
+                p => p.id === statusSender ||
+                     p.lid === statusSender
+              );
+              const botJid = sock.user?.id;
+              const bot = metadata.participants.find(
+                p => p.id === botJid ||
+                     p.id?.split(":")[0] === botJid?.split(":")[0]
+              );
+              const targetIsAdmin =
+                target?.admin === "admin" ||
+                target?.admin === "superadmin";
+              const botIsAdmin =
+                bot?.admin === "admin" ||
+                bot?.admin === "superadmin";
+
+              if (target && !targetIsAdmin && botIsAdmin) {
+                await sock.groupParticipantsUpdate(
+                  statusGroup, [target.id], "remove"
+                );
+                await sock.sendMessage(statusGroup, {
+                  text: "Group-status rule: a member was removed for posting a group status.",
+                });
+              } else {
+                await sock.sendMessage(statusGroup, {
+                  text: "Group-status rule triggered, but I couldn't safely remove the sender. Check my admin permissions and the sender's role.",
+                });
+              }
+            } catch (err) {
+              console.error("Anti-group-status kick failed:", err);
+            }
+          } else {
+            const canRevoke =
+              typeof sock.revokeGroupStatus === "function";
+
+            await sock.sendMessage(statusGroup, {
+              text: canRevoke
+                ? "Group-status rule triggered. Automatic deletion needs a supported status-revocation call."
+                : "Group-status rule triggered, but this Baileys version does not support group-status deletion. No deletion was performed.",
+            });
+          }
+        }
+        return;
+      }
+
+
         // Only enforce crash protection in groups.
         const isEarlyGroup =
           typeof earlyJid === "string" &&
@@ -5947,7 +6037,151 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
         ) || isOwner;
 
         // Check if user is actual group admin (without owner override)
-        const isGroupAdmin = groupMetadata.participants.some(
+
+    // GROUP_STATUS_COMMANDS_V1: separate from .antistatus.
+    if (command === "groupstatus" || command === "gs") {
+      if (!isAdmin) {
+        await sock.sendMessage(message.key.remoteJid, {
+          text: "Only group admins can post a group status."
+        }, { quoted: message });
+        return;
+      }
+
+      try {
+        const caption = args.join(" ").trim();
+        const original = message.message || {};
+        const imageMsg = original.imageMessage;
+        const videoMsg = original.videoMessage;
+
+        let content;
+        if (imageMsg || videoMsg) {
+          const buffer = await downloadMediaMessage(
+            message,
+            "buffer",
+            {},
+            {
+              logger: pino({ level: "silent" }),
+              reuploadRequest: sock.updateMediaMessage
+            }
+          );
+
+          content = imageMsg
+            ? { image: buffer, caption }
+            : { video: buffer, caption };
+        } else {
+          if (!caption) {
+            await sock.sendMessage(message.key.remoteJid, {
+              text: "Usage: .groupstatus Your status text\nOr send an image/video with the command as its caption."
+            }, { quoted: message });
+            return;
+          }
+          content = {
+            text: caption,
+            backgroundColor: "#673AB7"
+          };
+        }
+
+        const generated = await generateWAMessageContent(
+          content,
+          { upload: sock.waUploadToServer }
+        );
+        const secret = crypto.randomBytes(32);
+
+        const statusMessage = generateWAMessageFromContent(
+          message.key.remoteJid,
+          {
+            messageContextInfo: { messageSecret: secret },
+            groupStatusMessageV2: {
+              message: {
+                ...generated,
+                messageContextInfo: { messageSecret: secret }
+              }
+            }
+          },
+          {}
+        );
+
+        await sock.relayMessage(
+          message.key.remoteJid,
+          statusMessage.message,
+          { messageId: statusMessage.key.id }
+        );
+
+        groupStatusTracker.recordFromMessage(statusMessage);
+
+        await sock.sendMessage(message.key.remoteJid, {
+          text: "Group-status post sent to WhatsApp. Check the group status to confirm it appeared."
+        }, { quoted: message });
+      } catch (err) {
+        console.error("Group-status post failed:", err);
+        await sock.sendMessage(message.key.remoteJid, {
+          text: "I couldn't post that group status. Check the Railway/Termux logs for the error."
+        }, { quoted: message });
+      }
+      return;
+    }
+
+    if (command === "delgcstatus") {
+      await sock.sendMessage(message.key.remoteJid, {
+        text: typeof sock.revokeGroupStatus === "function"
+          ? "Status revocation is exposed, but deletion has not been wired into this command yet."
+          : "This Baileys version does not support group-status deletion, so I cannot delete it."
+      }, { quoted: message });
+      return;
+    }
+
+    if (command === "antigcstatus") {
+      if (!isAdmin) {
+        await sock.sendMessage(message.key.remoteJid, {
+          text: "Only group admins can change this setting."
+        }, { quoted: message });
+        return;
+      }
+
+      const groupJid = message.key.remoteJid;
+      const sub = (args[0] || "").toLowerCase();
+      const choice = (args[1] || "").toLowerCase();
+
+      if (sub === "on" || sub === "off") {
+        antiGroupStatusGroups[groupJid] = sub === "on";
+        if (!antiGroupStatusActions[groupJid]) {
+          antiGroupStatusActions[groupJid] = "delete";
+        }
+        await savePersistentGroupSettings(groupJid);
+        await sock.sendMessage(groupJid, {
+          text: `Anti-group-status is now ${sub.toUpperCase()}.`
+        }, { quoted: message });
+        return;
+      }
+
+      if (sub === "set" && ["delete", "kick"].includes(choice)) {
+        antiGroupStatusActions[groupJid] = choice;
+        await savePersistentGroupSettings(groupJid);
+        await sock.sendMessage(groupJid, {
+          text: choice === "delete"
+            ? "Mode set to DELETE, but your installed Baileys version cannot delete group statuses. It will warn instead."
+            : "Mode set to KICK. This requires the bot to be a group admin; group admins will not be removed."
+        }, { quoted: message });
+        return;
+      }
+
+      if (sub === "get") {
+        await sock.sendMessage(groupJid, {
+          text:
+            `Anti-group-status: ${antiGroupStatusGroups[groupJid] ? "ON" : "OFF"}\n` +
+            `Mode: ${antiGroupStatusActions[groupJid] || "delete"}\n` +
+            "Commands: .antigcstatus on/off/get\n.antigcstatus set delete/kick"
+        }, { quoted: message });
+        return;
+      }
+
+      await sock.sendMessage(groupJid, {
+        text: "Usage:\n.antigcstatus on\n.antigcstatus off\n.antigcstatus get\n.antigcstatus set delete\n.antigcstatus set kick"
+      }, { quoted: message });
+      return;
+    }
+
+    const isGroupAdmin = groupMetadata.participants.some(
           (p) =>
             p.id === sender &&
             (p.admin === "admin" || p.admin === "superadmin")
