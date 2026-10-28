@@ -6056,23 +6056,39 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
       }
 
       try {
+        // Unwrap common WhatsApp message containers safely.
+        function unwrapStatusMessage(msg) {
+          let current = msg || {};
+          for (let i = 0; i < 8; i++) {
+            const next =
+              current.ephemeralMessage?.message ||
+              current.viewOnceMessage?.message ||
+              current.viewOnceMessageV2?.message ||
+              current.viewOnceMessageV2Extension?.message ||
+              current.documentWithCaptionMessage?.message;
+            if (!next || next === current) break;
+            current = next;
+          }
+          return current;
+        }
+
         const original = message.message || {};
-        const contextInfo =
+        const currentMessage = unwrapStatusMessage(original);
+
+        // Find the quoted message context, including wrapped commands.
+        let contextInfo =
+          currentMessage.extendedTextMessage?.contextInfo ||
+          currentMessage.imageMessage?.contextInfo ||
+          currentMessage.videoMessage?.contextInfo ||
+          currentMessage.documentMessage?.contextInfo ||
           original.extendedTextMessage?.contextInfo ||
-          original.imageMessage?.contextInfo ||
-          original.videoMessage?.contextInfo ||
-          original.ephemeralMessage?.message?.extendedTextMessage?.contextInfo ||
-          original.ephemeralMessage?.message?.imageMessage?.contextInfo ||
-          original.ephemeralMessage?.message?.videoMessage?.contextInfo ||
           {};
 
-        const quoted = contextInfo.quotedMessage || {};
-        const commandText = args.join(" ").trim();
+        const quotedMessage = unwrapStatusMessage(
+          contextInfo.quotedMessage || {}
+        );
 
-        const currentMessage =
-          original.ephemeralMessage?.message || original;
-        const quotedMessage =
-          quoted.ephemeralMessage?.message || quoted;
+        const commandText = args.join(" ").trim();
 
         const imageMsg =
           currentMessage.imageMessage || quotedMessage.imageMessage;
@@ -6084,14 +6100,17 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           quotedMessage.extendedTextMessage?.text ||
           quotedMessage.imageMessage?.caption ||
           quotedMessage.videoMessage?.caption ||
+          quotedMessage.documentMessage?.caption ||
           "";
 
         const caption = commandText || quotedText.trim();
 
         let content;
+
         if (imageMsg || videoMsg) {
           let buffer;
 
+          // Download the media from the message that actually contains it.
           if (currentMessage.imageMessage || currentMessage.videoMessage) {
             buffer = await downloadMediaMessage(
               message,
@@ -6113,13 +6132,17 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
             buffer = Buffer.concat(chunks);
           }
 
+          if (!buffer || buffer.length === 0) {
+            throw new Error("Media download returned an empty buffer.");
+          }
+
           content = imageMsg
             ? { image: buffer, caption }
             : { video: buffer, caption };
         } else {
           if (!caption) {
             await sock.sendMessage(message.key.remoteJid, {
-              text: "Usage: .groupstatus Your status text\\nOr reply to a text/image/video with .groupstatus, or caption your media with the command."
+              text: "Usage: .groupstatus Your status text\nOr reply to a text/image/video with .groupstatus, or caption your media with the command."
             }, { quoted: message });
             return;
           }
@@ -6134,6 +6157,21 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           content,
           { upload: sock.waUploadToServer }
         );
+
+        // Mark the inner media payload as a group status.
+        if (generated.imageMessage) {
+          generated.imageMessage.contextInfo = {
+            ...(generated.imageMessage.contextInfo || {}),
+            isGroupStatus: true
+          };
+        }
+        if (generated.videoMessage) {
+          generated.videoMessage.contextInfo = {
+            ...(generated.videoMessage.contextInfo || {}),
+            isGroupStatus: true
+          };
+        }
+
         const secret = crypto.randomBytes(32);
 
         const statusMessage = generateWAMessageFromContent(
@@ -6159,12 +6197,12 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
         groupStatusTracker.recordFromMessage(statusMessage);
 
         await sock.sendMessage(message.key.remoteJid, {
-          text: "Group-status post sent to WhatsApp. Check the group status to confirm it appeared."
+          text: "Status message sent to WhatsApp. Please check the group status to confirm it appeared."
         }, { quoted: message });
       } catch (err) {
         console.error("Group-status post failed:", err);
         await sock.sendMessage(message.key.remoteJid, {
-          text: "I couldn't post that group status. Check the Railway/Termux logs for the error."
+          text: "I couldn't post that group status. Check the Railway logs for the error."
         }, { quoted: message });
       }
       return;
