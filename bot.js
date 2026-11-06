@@ -3010,7 +3010,7 @@ async function startBot() {
   // ☁️ Restore EXP data from Supabase
   await loadExpFromSupabase();
 
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info");
+  const { state, saveCreds } = await useMultiFileAuthState("/data/auth_info");
 
   const socketLogger = pino({ 
     level: process.env.DEBUG_BAILEYS === 'true' ? 'debug' : 'warn',
