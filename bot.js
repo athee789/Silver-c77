@@ -851,6 +851,9 @@ const antiSpamGroups = {};
 // key = groupJid:senderJid
 // value = { messages: [{ key, timestamp }], lastWarnTime }
 const spamTracker = new Map();
+const spamEnforcementInProgress = new Set();
+const antiSpamSeenMessages = new Map();
+const antiSpamMetadataCache = new Map();
 
 const SPAM_THRESHOLD = 5; // trigger on the 5th message
 const SPAM_WINDOW = 2000; // 2 seconds
@@ -4242,6 +4245,267 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
     }
   });
 
+  
+  // ============================================================
+  // SILVER ANTISPAM V2 — independent batch-aware enforcement
+  // ============================================================
+  sock.ev.on("messages.upsert", async (m) => {
+    if (m?.type !== "notify" || !Array.isArray(m.messages)) return;
+
+    for (const incoming of m.messages) {
+      try {
+        const key = incoming?.key;
+        const groupId = key?.remoteJid;
+
+        if (
+          !key ||
+          !key.id ||
+          !groupId ||
+          !groupId.endsWith("@g.us") ||
+          key.fromMe
+        ) continue;
+
+        const senderCandidates = [
+          key.participant,
+          key.participantAlt,
+          incoming.participant
+        ].filter(Boolean);
+
+        if (!senderCandidates.length) continue;
+
+        const sender = senderCandidates[0];
+
+        // Ignore the bot's own identity.
+        const botIds = [
+          sock.user?.id,
+          sock.user?.lid
+        ].filter(Boolean);
+
+        const cleanJid = value =>
+          String(value || "").toLowerCase().split(":")[0];
+
+        if (senderCandidates.some(candidate =>
+          botIds.some(botId => cleanJid(candidate) === cleanJid(botId))
+        )) continue;
+
+        // Check owner and sudo using all available sender identities.
+        const privileged = senderCandidates.some(candidate =>
+          isOwnerNumber(candidate) || isSudoUser(candidate)
+        );
+
+        if (privileged) continue;
+
+        const mode = antiSpamGroups[groupId];
+        if (mode !== "warn" && mode !== "kick") continue;
+
+        // Avoid duplicate delivery of the same WhatsApp message.
+        const seenKey = `${groupId}:${key.id}`;
+        const now = Date.now();
+
+        if (antiSpamSeenMessages.has(seenKey)) continue;
+        antiSpamSeenMessages.set(seenKey, now);
+
+        // Periodically clean the duplicate-message cache.
+        if (antiSpamSeenMessages.size > 1000) {
+          for (const [id, timestamp] of antiSpamSeenMessages) {
+            if (now - timestamp > 10000) {
+              antiSpamSeenMessages.delete(id);
+            }
+          }
+        }
+
+        // Reuse group metadata briefly during message bursts.
+        let metadataEntry = antiSpamMetadataCache.get(groupId);
+
+        if (!metadataEntry || metadataEntry.expiresAt <= now) {
+          metadataEntry = {
+            promise: sock.groupMetadata(groupId),
+            expiresAt: now + 2000
+          };
+          antiSpamMetadataCache.set(groupId, metadataEntry);
+        }
+
+        let metadata;
+
+        try {
+          metadata = await metadataEntry.promise;
+        } catch (err) {
+          if (antiSpamMetadataCache.get(groupId) === metadataEntry) {
+            antiSpamMetadataCache.delete(groupId);
+          }
+          logger.error({
+            group: groupId,
+            error: err?.message
+          }, "ANTISPAM: Could not verify group participants; message skipped");
+          continue;
+        }
+
+        const participant = metadata.participants.find(p => {
+          const participantIds = [p.id, p.lid, p.phoneNumber].filter(Boolean);
+          return participantIds.some(id =>
+            senderCandidates.some(candidate =>
+              cleanJid(id) === cleanJid(candidate)
+            )
+          );
+        });
+
+        if (!participant) continue;
+
+        const isAdmin =
+          participant.admin === "admin" ||
+          participant.admin === "superadmin";
+
+        if (isAdmin) continue;
+
+        const targetJid = participant.id || sender;
+        const trackerKey = `${groupId}:${cleanJid(targetJid)}`;
+
+        if (spamEnforcementInProgress.has(trackerKey)) continue;
+
+        const latestMode = antiSpamGroups[groupId];
+        if (latestMode !== "warn" && latestMode !== "kick") continue;
+
+let tracker = spamTracker.get(trackerKey);
+
+        if (!tracker) {
+          tracker = { messages: [] };
+        }
+
+        tracker.messages = tracker.messages.filter(
+          item => now - item.timestamp <= SPAM_WINDOW
+        );
+
+        // A message ID must only be stored once in this burst.
+        if (tracker.messages.some(item => item.key.id === key.id)) {
+          spamTracker.set(trackerKey, tracker);
+          continue;
+        }
+
+        tracker.messages.push({
+          key,
+          timestamp: now
+        });
+
+        spamTracker.set(trackerKey, tracker);
+
+        if (tracker.messages.length < SPAM_THRESHOLD) continue;
+
+        // Capture the five-message burst and lock the sender immediately.
+        const burst = tracker.messages.slice(0, SPAM_THRESHOLD);
+
+        spamTracker.delete(trackerKey);
+        spamEnforcementInProgress.add(trackerKey);
+
+        const userNumber = targetJid.split("@")[0].split(":")[0];
+
+        try {
+          const deletions = await Promise.allSettled(
+            burst.map(item =>
+              sock.sendMessage(groupId, { delete: item.key })
+            )
+          );
+
+          const failedDeletes = deletions.filter(
+            result => result.status === "rejected"
+          );
+
+          if (failedDeletes.length) {
+            logger.error({
+              group: groupId,
+              sender: targetJid,
+              attempted: burst.length,
+              failed: failedDeletes.length,
+              errors: failedDeletes.map(item => item.reason?.message)
+            }, "ANTISPAM: Some burst messages could not be deleted");
+          } else {
+            logger.info({
+              group: groupId,
+              sender: targetJid,
+              deleted: burst.length
+            }, "ANTISPAM: Burst messages deleted");
+          }
+
+          // Re-read the mode in case an admin changed it during enforcement.
+          const currentMode = antiSpamGroups[groupId];
+          if (currentMode !== "warn" && currentMode !== "kick") continue;
+
+          if (currentMode === "warn") {
+            if (!userWarns[groupId]) userWarns[groupId] = {};
+
+            userWarns[groupId][targetJid] =
+              (userWarns[groupId][targetJid] || 0) + 1;
+
+            const warnCount = userWarns[groupId][targetJid];
+            saveData();
+
+            await sock.sendMessage(groupId, {
+              text:
+                `⚠️ @${userNumber} slow down! Sending 5 messages within 2 seconds is considered spam.\n\n` +
+                `Warning ${warnCount}/3.`,
+              mentions: [targetJid]
+            });
+
+            if (warnCount >= 3) {
+              try {
+                await sock.groupParticipantsUpdate(
+                  groupId,
+                  [targetJid],
+                  "remove"
+                );
+
+                await sock.sendMessage(groupId, {
+                  text: `🚫 @${userNumber} removed after 3 spam warnings.`,
+                  mentions: [targetJid]
+                });
+
+                delete userWarns[groupId][targetJid];
+                saveData();
+              } catch (err) {
+                logger.error({
+                  group: groupId,
+                  sender: targetJid,
+                  error: err?.message
+                }, "ANTISPAM: Failed to kick after 3 warnings");
+              }
+            }
+          } else if (currentMode === "kick") {
+            await sock.sendMessage(groupId, {
+              text: `⚠️ @${userNumber} was detected spamming. Slow down.`,
+              mentions: [targetJid]
+            });
+
+            await sock.groupParticipantsUpdate(
+              groupId,
+              [targetJid],
+              "remove"
+            );
+
+            await sock.sendMessage(groupId, {
+              text: `🚫 @${userNumber} removed for spamming.`,
+              mentions: [targetJid]
+            });
+          }
+        } catch (err) {
+          logger.error({
+            group: groupId,
+            sender: targetJid,
+            error: err?.message,
+            stack: err?.stack
+          }, "ANTISPAM: Enforcement failed");
+        } finally {
+          spamEnforcementInProgress.delete(trackerKey);
+        }
+      } catch (err) {
+        logger.error({
+          error: err?.message,
+          stack: err?.stack
+        }, "ANTISPAM: Message processing failed");
+      }
+    }
+  });
+  // END SILVER ANTISPAM V2
+
+
   sock.ev.on("messages.upsert", async (m) => {
     try {
       const message = m.messages[0];
@@ -6922,151 +7186,7 @@ console.log('MESSAGE TYPE:', Object.keys(message.message || {}));
         }
 
         // ============================================
-        // Anti-Spam Enforcement
-        // 5 messages within 2 seconds = spam burst
-        // ============================================
-        const antiSpamAction = antiSpamGroups[message.key.remoteJid];
-
-        logger.info({
-          feature: "antispam",
-          enabled: Boolean(antiSpamAction),
-          mode: antiSpamAction || false,
-          isAdmin,
-          canUseAsOwner,
-          fromMe: Boolean(message.key.fromMe),
-          skippedBecause: !antiSpamAction
-            ? "FEATURE_DISABLED"
-            : (isAdmin || canUseAsOwner || message.key.fromMe)
-              ? "BYPASS_USER"
-              : "GATE_PASSED"
-        }, "🧪 ANTISPAM DECISION");
-
-        if (
-          antiSpamAction &&
-          !isAdmin &&
-          !canUseAsOwner &&
-          !message.key.fromMe
-        ) {
-          const groupId = message.key.remoteJid;
-          const trackerKey = `${groupId}:${sender}`;
-          const now = Date.now();
-
-          let tracker = spamTracker.get(trackerKey);
-
-          if (!tracker) {
-            tracker = {
-              messages: [],
-              lastWarnTime: 0,
-            };
-          }
-
-          // Remove messages outside the 2-second window.
-          tracker.messages = tracker.messages.filter(
-            item => now - item.timestamp <= SPAM_WINDOW
-          );
-
-          // Store this message's key so we can delete the
-          // entire burst when the 5th message arrives.
-          tracker.messages.push({
-            key: message.key,
-            timestamp: now,
-          });
-
-          spamTracker.set(trackerKey, tracker);
-
-          // Trigger exactly when 5 messages are inside
-          // the 2-second window.
-          if (tracker.messages.length >= SPAM_THRESHOLD) {
-            const spamMessages = [...tracker.messages];
-            const userNumber = sender.split("@")[0];
-
-            // Reset immediately so the same burst cannot
-            // trigger repeatedly while deletion is happening.
-            spamTracker.delete(trackerKey);
-
-            // Delete ALL messages in the burst.
-            await Promise.allSettled(
-              spamMessages.map(item =>
-                sock.sendMessage(groupId, {
-                  delete: item.key,
-                })
-              )
-            );
-
-            // Warn the sender.
-            try {
-              if (antiSpamAction === "warn") {
-                if (!userWarns[groupId]) {
-                  userWarns[groupId] = {};
-                }
-
-                if (!userWarns[groupId][sender]) {
-                  userWarns[groupId][sender] = 0;
-                }
-
-                userWarns[groupId][sender]++;
-
-                const warnCount = userWarns[groupId][sender];
-
-                saveData();
-
-                await sock.sendMessage(groupId, {
-                  text: `⚠️ @${userNumber} slow down! Sending 5 messages within 2 seconds is considered spam.\n\nWarning ${warnCount}/3.`,
-                  mentions: [sender],
-                });
-
-                // Preserve the existing 3-warning kick system.
-                if (warnCount >= 3) {
-                  try {
-                    await sock.groupParticipantsUpdate(
-                      groupId,
-                      [sender],
-                      "remove"
-                    );
-
-                    await sock.sendMessage(groupId, {
-                      text: `🚫 @${userNumber} removed after 3 spam warnings.`,
-                      mentions: [sender],
-                    });
-
-                    delete userWarns[groupId][sender];
-                    saveData();
-                  } catch (err) {
-                    logger.error(
-                      { error: err.message },
-                      "Failed to kick user after antispam warnings"
-                    );
-                  }
-                }
-              } else if (antiSpamAction === "kick") {
-                await sock.sendMessage(groupId, {
-                  text: `⚠️ @${userNumber} was detected spamming. Slow down.`,
-                  mentions: [sender],
-                });
-
-                await sock.groupParticipantsUpdate(
-                  groupId,
-                  [sender],
-                  "remove"
-                );
-
-                await sock.sendMessage(groupId, {
-                  text: `🚫 @${userNumber} removed for spamming.`,
-                  mentions: [sender],
-                });
-              }
-            } catch (err) {
-              logger.error(
-                { error: err.message },
-                "Failed to warn/kick antispam user"
-              );
-            }
-
-            return;
-          }
-        }
-
-        const canUseBot = canUseAsOwner || (botMode === "public");
+const canUseBot = canUseAsOwner || (botMode === "public");
 
         const expPublicCommands =
           isGroup &&
